@@ -1,17 +1,16 @@
-import OpenAI from "openai";
+// import OpenAI from "openai";
+import { OpenRouter } from "@openrouter/sdk";
+
 import User from "../models/User.js";
 import Job from "../models/Job.js";
 import JobApplication from "../models/JobApplication.js";
 import { extractTextFromCloudinary } from "../utils/cvExtract.js";
 
-const openai = new OpenAI({
+const openrouter = new OpenRouter({
   apiKey: process.env.OPENROUTER_API_KEY,
-  baseURL: "https://openrouter.ai/api/v1",
-  defaultHeaders: {
-    "HTTP-Referer": "http://localhost:5173",
-    "X-Title": "CV Screening Project",
-  },
 });
+
+const MODEL = process.env.AI_MODEL || "tngtech/tng-r1t-chimera:free";
 
 function buildPrompt({ jd, cvText }) {
   return `
@@ -70,13 +69,11 @@ export async function screenApplication(req, res) {
       return res.status(404).json({ message: "Application not found" });
     }
 
-    // Lấy thông tin user và CV URL
     const user = await User.findById(application.userId);
     if (!user || !user.resume) {
       return res.status(400).json({ message: "User has no resume uploaded" });
     }
 
-    // Trích xuất text từ CV
     const cvText = await extractTextFromCloudinary(
       user.resume,
       "application/pdf"
@@ -88,7 +85,7 @@ export async function screenApplication(req, res) {
           "CV text is empty or unreadable. Please re-upload a clearer PDF/DOCX.",
       });
     }
-    // Lấy Job Description
+
     const job = await Job.findById(application.jobId);
     if (!job) {
       return res.status(404).json({ message: "Job not found" });
@@ -98,68 +95,57 @@ export async function screenApplication(req, res) {
       .filter(Boolean)
       .join("\n");
 
-    // Tạo prompt và gọi OpenAI
     const prompt = buildPrompt({ jd, cvText });
 
-    // ... existing code ...
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",
+    // G?i OpenRouter (kh�ng streaming)
+    const completion = await openrouter.chat.send({
+      model: MODEL,
       messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-      max_tokens: 2000,
+      stream: false,
     });
 
-    const raw = completion.choices?.[0]?.message?.content || "{}";
+    const raw = completion?.choices?.[0]?.message?.content || "{}";
 
-    // Debug: Log raw response từ AI
     console.log("=== AI RAW RESPONSE ===");
     console.log(raw);
     console.log("=== END AI RESPONSE ===");
 
-    // Parse JSON response
-     let parsed;
+    let parsed;
     try {
       parsed = JSON.parse(raw);
-      console.log("✅ Successfully parsed JSON:", parsed);
-      
-      // Validate JD quality và điểm số
-      if (parsed.jd_quality === "poor" && parsed.score > 25) {
-        console.warn("⚠️ AI cho điểm cao với JD kém chất lượng, điều chỉnh xuống 15");
-        parsed.score = 15;
-        parsed.reasons.must_have_skills = "JD không đủ thông tin để đánh giá - điểm thấp";
-      }
-      
-    } catch (parseError) {
+      console.log("? Successfully parsed JSON:", parsed);
 
-      // Fallback 1: Tìm JSON trong markdown code block
+      if (parsed.jd_quality === "poor" && parsed.score > 25) {
+        console.warn(
+          "?? AI cho di?m cao v?i JD k�m ch?t lu?ng, di?u ch?nh xu?ng 15"
+        );
+        parsed.score = 15;
+        parsed.reasons.must_have_skills =
+          "JD kh�ng d? th�ng tin d? d�nh gi� - di?m th?p";
+      }
+    } catch (parseError) {
       const markdownMatch = raw.match(/```json\s*([\s\S]*?)\s*```/);
       if (markdownMatch) {
         try {
           parsed = JSON.parse(markdownMatch[1]);
-          console.log("✅ Markdown JSON parse success:", parsed);
+          console.log("? Markdown JSON parse success:", parsed);
         } catch (markdownError) {
-          console.log("❌ Markdown parse failed:", markdownError.message);
+          console.log("? Markdown parse failed:", markdownError.message);
         }
       }
 
-      // Fallback 2: Tìm JSON object trong text
       if (!parsed) {
         const jsonMatch = raw.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           try {
             parsed = JSON.parse(jsonMatch[0]);
-            console.log("✅ Fallback JSON parse success:", parsed);
+            console.log("? Fallback JSON parse success:", parsed);
           } catch (fallbackError) {
-            console.log(
-              "❌ Fallback parse also failed:",
-              fallbackError.message
-            );
+            console.log("? Fallback parse also failed:", fallbackError.message);
           }
         }
       }
 
-      // Fallback 3: Tạo response lỗi
       if (!parsed) {
         parsed = {
           extract: null,
@@ -173,14 +159,11 @@ export async function screenApplication(req, res) {
       }
     }
 
-    // ... rest of the code ...
-
-    // Cập nhật JobApplication với kết quả AI
     await JobApplication.findByIdAndUpdate(applicationId, {
       aiScore: parsed.score ?? null,
       aiReasons: JSON.stringify(parsed.reasons ?? {}),
       aiExtract: parsed.extract ?? null,
-      aiVersion: "gpt-4o-mini@v1",
+      aiVersion: MODEL,
       aiReviewed: false,
     });
 
@@ -197,13 +180,12 @@ export async function screenApplication(req, res) {
   } catch (error) {
     console.error("AI Screening Error:", error);
     return res.status(500).json({
-      message: "http://localhost:5000/api/users/applications/screen",
+      message: "AI screening failed",
       error: error.message,
     });
   }
 }
 
-// Endpoint để lấy kết quả AI screening
 export async function getAIScreeningResult(req, res) {
   try {
     const { applicationId } = req.params;
